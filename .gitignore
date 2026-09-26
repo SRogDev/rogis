@@ -1,0 +1,4 @@
+# .gitignore for Rogis
+/target/
+**/*.rs.bk
+.env
