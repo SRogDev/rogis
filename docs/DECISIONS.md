@@ -9,7 +9,7 @@
 | Category | Pick | Version (2026-09-26) | Why |
 |---|---|---|---|
 | Async runtime | **tokio** (multi-thread flavor) | 1.53.1 | De facto standard; no serious alternative for this workload. Decided by research. |
-| HNSW index | **hnsw_rs** | 0.3.4 | Only pure-Rust crate with true incremental insert + parallel insert/search + dump/reload. See §B. |
+| HNSW index | **hnsw_rs** (+ `simdeez_f` feature) | 0.3.4 | Only pure-Rust crate with true incremental insert + parallel insert/search + dump/reload. SIMD distances are NOT default — must enable the feature or evals are 10–100× slower. See §B. |
 | Concurrent KV | **std sharded `Mutex<HashMap>`** (16+ shards) | std | Matches dashmap/parking_lot throughput (§D), zero extra deps, and each shard behaves like a mini single-threaded Redis — simplest correct mental model for the locked sharded-store design. |
 | RESP parsing | **hand-rolled parser** (hot path) + `redis-protocol` as conformance oracle in dev-deps | redis-protocol 6.0.0 | Hand-rolled is ~10x faster and 40 lines (§C). RESP2 command shape (array of bulk strings) is genuinely simple; full RESP2/3 only needed for response *encoding*, which is trivial to hand-roll. Use the crate in tests to verify our wire bytes decode identically. |
 | Embeddings (phase 2) | **ort** | 2.0.0-rc.13 (note: 2.0 still RC) | See §E. |
@@ -58,7 +58,58 @@ expensive part of a miss. Bulk loads should use `parallel_insert`.
 
 ### 100k vectors @ 768 dims (hnsw_rs)
 
-<!--RESULTS-BIG-->
+**Scale note (honest):** a full 100k build exceeded the time-box on the shared
+2-core VM (a Domino-RL training job was using >60% CPU throughout). Measured at
+**25k vectors @ 768 dims** instead; HNSW query cost grows logarithmically, so
+these numbers are representative of 100k within a small factor. A full 100k
+build+recall belongs in the Phase-1 benchmark harness on quiet hardware.
+
+| Measurement | Result |
+|---|---|
+| Build (parallel_insert, ef_construction=100) | 25k vectors in ~250 s (**~100 vec/s**) on contended box; expect 2–3× on quiet hardware |
+| Top-10 query latency (n=5k) | **~1.1 ms** (ef_search=24) / **~4.0 ms** (ef_search=100) |
+| Recall@10, uniform random data (adversarial) | 0.50 (ef=24) / **0.86** (ef=100) |
+| Exact-match rank-1 (sanity) | 9/10 |
+
+Two methodology corrections worth recording:
+
+1. **Metric mismatch artifact.** First recall run scored 0.17 because ground truth
+   used squared-Euclidean while HNSW ranked by dot product. On near-equidistant
+   uniform data, float-level norm noise flips the exact top-10 between the two
+   metrics. Recomputing ground truth with the *same* dot-product metric gives
+   0.86. Lesson for the Phase-1 harness: ground truth must use the identical
+   distance function as the index.
+2. **Uniform random data is the worst case for recall.** Real embeddings
+   (MiniLM etc.) are clustered — nearest neighbors are meaningfully closer than
+   the background — so production recall will beat these numbers.
+
+### Critical finding: enable SIMD distances (`simdeez_f`)
+
+`hnsw_rs` forwards to `anndists`, whose `DistDot::eval` is **scalar by default**.
+Measured per-eval cost at 768 dims:
+
+| Distance eval (768 dims) | Cost |
+|---|---|
+| `DistDot` scalar (default features) | ~7 µs (contended; ~1 µs quiet) |
+| `DistDot` with `hnsw_rs/simdeez_f` (AVX2) | **~64 ns** |
+
+All query/build numbers above use the SIMD build. **Decision: Rogis enables
+`hnsw_rs`' `simdeez_f` (or `stdsimd`) feature — without it, distance evals are
+10–100× slower.** Related landmine: the scalar fallback of `DistDot` contains
+`assert!(1 - dot >= 0)` with no epsilon tolerance, which panics on float dust
+when a vector is compared with itself; the SIMD path clamps instead. Prefer the
+SIMD build and treat the scalar path as unsupported.
+
+### Design consequences for Rogis
+
+- Store vectors **L2-normalized** and use **dot product** (`DistDot`) as the
+  canonical distance: same ranking as cosine for normalized vectors, SIMD-fast,
+  no per-eval norm computation (unlike `DistCosine`, which is scalar f64 and
+  ~100× slower per eval).
+- Normalize once at `SEMSET`; reject or renormalize on read paths that bypass it.
+- `ef_construction=100`, `M=16` are sane v0.1 defaults; expose `ef_search` as a
+  per-`SEMGET` or per-namespace tuning knob (latency/recall tradeoff: 1 ms @
+  recall 0.5 vs 4 ms @ recall 0.86 on adversarial data).
 
 ## C. RESP parsing
 
@@ -105,7 +156,7 @@ worked through the proxy without intervention.
 
 Implication for phase 2: server-side embedding is feasible (build works, model
 loads fast), but 130 ms CPU inference would **dominate** a `SEMGET`-by-text path
-whose HNSW lookup is sub-millisecond. Phase-2 options: keep embeddings
+whose HNSW lookup is ~1–4 ms. Phase-2 options: keep embeddings
 client-side (locked for MVP), batch server-side inference, or ship a smaller /
 quantized model. The number to beat is the client's own embedding call — which
 they already pay today.
@@ -116,9 +167,13 @@ Per-op serialization tax for one 768-dim vector (release build):
 
 | Path | Cost |
 |---|---|
-| JSON round-trip (what Python libs over Redis actually do) | **~72 µs** (42 µs ser + 31 µs de) |
-| bincode round-trip (best-case binary) | ~2.3 µs |
-| Native f32 array (zero-copy reinterpret, what Rogis does) | ~0 |
+| JSON round-trip (what Python libs over Redis actually do) | **~70–400 µs** (ser + de; varies with machine load) |
+| bincode round-trip (best-case binary) | ~2–15 µs |
+| Native f32 array: memcpy | ~0.2 µs |
+| Native f32 array: zero-copy reinterpret (what Rogis does) | ~0 |
+
+Absolute values move with machine load; the stable finding is the **2–3
+orders-of-magnitude gap** between serialized and native paths.
 
 A "semantic cache as a library over Redis" pays this tax on **every** vector
 store/retrieve, *plus* a network round-trip (hundreds of µs localhost, ms remote)
@@ -133,7 +188,11 @@ still to measure in Phase 1 (no `redis-server` binary in this environment).
 - End-to-end comparison against **real Redis** (storing the vector as a serialized
   string) was not possible: no `redis-server` binary in this environment. Phase 1
   must run the parity benchmark (same machine, same RESP protocol) before claiming wins.
-- HNSW numbers above are on synthetic uniform data on 2 cores; recall/latency on
-  real embedding distributions (clustered) and larger core counts still to measure.
+- HNSW recall/latency above are on synthetic uniform data (worst case) on a
+  contended 2-core box; recall on real embedding distributions (clustered) and a
+  full 100k build on quiet hardware belong in the Phase-1 benchmark harness.
 - `ort` 2.0 is still release-candidate — pin the RC for phase 2 and re-evaluate at
   2.0 stable.
+- The scalar fallback of `anndists::DistDot` panics on float dust (`assert!(1 -
+  dot >= 0)`); Rogis must always build with SIMD features and never rely on the
+  scalar path. Worth an upstream issue.
