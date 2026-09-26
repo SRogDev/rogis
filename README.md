@@ -13,6 +13,34 @@ Rogis starts from a simple thesis: there is room for a cache-database built from
 
 > Rogis is a cache, deliberately. Not a general-purpose vector DB for large-scale RAG, not a multi-model database, not an agent orchestration framework.
 
+## Quickstart
+
+```bash
+cargo run --release --bin rogis -- --port 6379   # one-command start, speaks RESP2 on 6379
+```
+
+Then connect with any Redis client — no code changes:
+
+```bash
+redis-cli -p 6379
+127.0.0.1:6379> SET hello rogis
+OK
+127.0.0.1:6379> GET hello
+"rogis"
+```
+
+```python
+import redis
+r = redis.Redis(host="127.0.0.1", port=6379, decode_responses=True)
+r.set("hello", "rogis")  # True
+```
+
+Flags: `--port`, `--dir ./data` (persistence directory), `--save 60`
+(snapshot every N seconds when dirty; `0` disables), `--appendonly yes|no`.
+See [docs/INTEGRATION.md](docs/INTEGRATION.md) for the full integration guide
+(patterns: locks, cache-aside, rate limiting, sessions, queues, pub/sub) and
+[benches/parity.sh](benches/parity.sh) for the throughput harness.
+
 ## Status
 
 **Phase 0 — technical spikes** (in progress). See [PLAN.md](PLAN.md) for the full build plan and [docs/](docs/) for the strategic planning document.

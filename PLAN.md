@@ -62,6 +62,15 @@ When Phase 1 is finished, Rogis must be **ready for trial integration into a rea
 - `docs/INTEGRATION.md`: copy-paste snippets for (a) drop-in deterministic usage and (b) the semantic-cache loop (`SEMSET` / `SEMGET` with client-computed vectors, hit → return, miss → LLM → store).
 - The parity benchmark ships as a runnable script in `benches/` (anyone can re-run it).
 
+### Phase 1 status (2026-09-26) — deterministic layer COMPLETE
+
+- Server: Tokio multi-thread, 16-shard store, RESP2 + RESP3 (HELLO handshake, `%` maps, `>` push frames, `_` nulls on RESP3).
+- Commands: PING, SET (EX/PX/NX/XX), GET, DEL, EXISTS, EXPIRE, PEXPIRE, TTL, INCR, DECR, INCRBY, HSET, HGET, HGETALL, HDEL, LPUSH, RPOP, LRANGE, SETNX, PUBLISH, SUBSCRIBE, UNSUBSCRIBE, SAVE, QUIT, HELLO, CLIENT (SETINFO accepted/ignored).
+- Persistence: `dump.rogb` snapshot + RESP-encoded AOF; snapshot atomically truncates AOF (no double-apply); restart verified.
+- **Real-client acceptance**: stock `redis-py` 8.1.0 (RESP3 default), zero client changes — ping, set/get/TTL, incr, hgetall→dict, lists, NX lock (contended→None), exists/del, honest `SEMSET` unknown-command error, pub/sub, SAVE — all pass. Two real interop bugs found and fixed via this session: (1) `HELLO`/RESP3 handshake missing, (2) `$-1` nils hang redis-py's RESP3 parser → now `_\r\n`; `HGETALL` returns a real map on RESP3.
+- Tests: 123 green; strict Clippy + fmt clean. Benchmark (`benches/parity.sh`, 20k ops × 16 clients): ~65–68k ops/s, 0 errors — self-consistent Rogis numbers only; **parity vs real Redis NOT measured** (no redis-server obtainable in this environment: apt mirror dead, direct download blocked). The script prints this gap honestly when redis-server is absent.
+- Known v0.1 limits: no auth/SELECT/SHUTDOWN/pattern-subscribe/clustering/replication/streams; cross-shard multi-key ops non-atomic; fsync 1/s (≈1s loss window on hard kill); `SEMSET`/`SEMGET` = Phase 2.
+
 ## Roadmap
 
 | Phase | Content | Exit criteria |
