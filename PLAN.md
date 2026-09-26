@@ -55,6 +55,13 @@ Design notes: no fixed default threshold in docs — expose empirical measuremen
 - Re-run competitors' public benchmarks ourselves (BetterDB/RedisVL); dedicated search for Rust engine-level semantic-cache projects on crates.io/GitHub
 - Order the 5 risks by severity: which one kills the project if false vs only forces a pitch adjustment
 
+## Definition of done (Roger's acceptance)
+
+When Phase 1 is finished, Rogis must be **ready for trial integration into a real app**:
+- `cargo run --release` (documented one-command start) brings up the server on `6379` speaking RESP — any real Redis client (`redis-cli`, `redis-py`, `ioredis`, `go-redis`) connects with zero client changes.
+- `docs/INTEGRATION.md`: copy-paste snippets for (a) drop-in deterministic usage and (b) the semantic-cache loop (`SEMSET` / `SEMGET` with client-computed vectors, hit → return, miss → LLM → store).
+- The parity benchmark ships as a runnable script in `benches/` (anyone can re-run it).
+
 ## Roadmap
 
 | Phase | Content | Exit criteria |
